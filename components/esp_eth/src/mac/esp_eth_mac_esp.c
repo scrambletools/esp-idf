@@ -582,6 +582,65 @@ static esp_err_t emac_esp32_deinit(esp_eth_mac_t *mac)
     return ESP_OK;
 }
 
+/* Recovery-only: full EMAC core reset + reconfigure while the driver
+ * is running with the link up. On SoCs whose small RX FIFO forces
+ * threshold mode (ESP32-P4: 256 B) an RX FIFO overflow can latch the
+ * MTL FIFO dead — reception never resumes even though the DMA sits in
+ * Running-waiting with free descriptors, and neither poll demands, MAC
+ * receiver toggles, nor a plain stop/start clear it. Only the DMA
+ * software reset does. The reset requires active PHY RX/TX clocks to
+ * complete, which is why it cannot simply live in emac start (boot
+ * races the PHY and the reset times out); with the link up — the only
+ * state the lockup occurs in — the clocks are guaranteed present.
+ * Preserves the live (PHY-negotiated) MAC configuration across the
+ * reset. */
+static emac_esp32_t *s_recover_emac = NULL;
+
+esp_err_t emac_esp_rx_full_recover(void)
+{
+    emac_esp32_t *emac = s_recover_emac;
+    if (emac == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* snapshot the negotiated MAC config (speed, duplex, offloads) */
+    uint32_t saved_gmacconfig = ((emac_mac_dev_t *)emac->hal.mac_regs)->gmacconfig.val;
+    emac_hal_stop(&emac->hal); /* best effort; may report frames in flight */
+    emac_hal_reset(&emac->hal);
+    uint32_t reset_to = 0;
+    for (reset_to = 0; reset_to < emac->sw_reset_timeout_ms / 10; reset_to++) {
+        if (emac_hal_is_reset_done(&emac->hal)) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_RETURN_ON_FALSE(reset_to < emac->sw_reset_timeout_ms / 10, ESP_ERR_TIMEOUT,
+                        TAG, "recover: reset timeout");
+    uint32_t csr_freq_hz;
+    soc_module_clk_t csr_clk_src = emac_ll_get_csr_clk_src();
+    ESP_RETURN_ON_ERROR(esp_clk_tree_src_get_freq_hz(csr_clk_src,
+                                                     ESP_CLK_TREE_SRC_FREQ_PRECISION_APPROX,
+                                                     &csr_freq_hz),
+                        TAG, "recover: get CSR frequency failed");
+    if (emac->mdc_freq_hz <= 0) {
+        emac_hal_set_csr_clock_range(&emac->hal, csr_freq_hz);
+    } else {
+        emac_hal_find_set_closest_csr_clock_range(&emac->hal, emac->mdc_freq_hz, csr_freq_hz);
+    }
+    emac_hal_init_mac_default(&emac->hal);
+    emac_hal_dma_config_t dma_config = { .dma_burst_len = emac->dma_burst_len };
+    emac_hal_init_dma_default(&emac->hal, &dma_config);
+    uint8_t mac_addr[ETH_ADDR_LEN];
+    ESP_RETURN_ON_ERROR(esp_read_mac(mac_addr, ESP_MAC_ETH), TAG,
+                        "recover: fetch mac address failed");
+    emac_hal_set_address(&emac->hal, mac_addr);
+    /* restore the live config captured above (includes speed/duplex the
+     * link state machine will not re-apply without a link transition) */
+    ((emac_mac_dev_t *)emac->hal.mac_regs)->gmacconfig.val = saved_gmacconfig;
+    emac_esp_dma_reset(emac->emac_dma_hndl);
+    emac_hal_start(&emac->hal);
+    return ESP_OK;
+}
+
 static esp_err_t emac_esp32_start(esp_eth_mac_t *mac)
 {
     emac_esp32_t *emac = __containerof(mac, emac_esp32_t, parent);
@@ -646,7 +705,13 @@ IRAM_ATTR void emac_isr_default_handler(void *args)
 #endif // SOC_EMAC_IEEE1588V2_SUPPORTED
 
 #if EMAC_LL_CONFIG_ENABLE_INTR_MASK & EMAC_LL_INTR_RECEIVE_ENABLE
-    if (intr_stat & EMAC_LL_DMA_RECEIVE_FINISH_INTR) {
+    /* RECEIVE_BUFF_UNAVAILABLE must also wake the receive task: when the RX
+     * descriptor ring is completely full the DMA suspends and no further
+     * RECEIVE_FINISH interrupts occur, so RBU is the only signal left to
+     * trigger draining (which frees descriptors and issues the receive poll
+     * demand that resumes the DMA). */
+    if (intr_stat & (EMAC_LL_DMA_RECEIVE_FINISH_INTR |
+                     EMAC_LL_DMA_RECEIVE_BUFF_UNAVAILABLE_INTR)) {
         BaseType_t rx_high_task_woken = pdFALSE;
         /* notify receive task */
         vTaskNotifyGiveFromISR(emac->rx_task_hdl, &rx_high_task_woken);
@@ -1025,6 +1090,7 @@ esp_eth_mac_t *esp_eth_mac_new_esp32(const eth_esp32_emac_config_t *esp32_config
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
     emac->ts_target_exceed_cb_from_isr = NULL;
 #endif // SOC_EMAC_IEEE1588V2_SUPPORTED
+    s_recover_emac = emac; /* for emac_esp_rx_full_recover */
     return &(emac->parent);
 
 err:

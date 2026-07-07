@@ -337,6 +337,22 @@ static esp_err_t emac_esp_dma_get_valid_recv_len(emac_esp_dma_handle_t emac_esp_
         }
         /* First segment in frame */
         if (desc_iter->RDES0.FirstDescriptor) {
+            /* Reclaim any preceding first-without-last segments: a frame
+             * whose tail was cut by an RX FIFO overflow leaves CPU-owned
+             * descriptors for which no LastDescriptor will ever arrive.
+             * The walk used to just skip past them, so they were never
+             * returned to the DMA and the usable ring shrank permanently —
+             * enough overflow bursts leaked every descriptor and reception
+             * stalled for good. Hand them back and restart reception. */
+            if (emac_esp_dma->rx_desc != desc_iter) {
+                eth_dma_rx_descriptor_t *orphan = emac_esp_dma->rx_desc;
+                while (orphan != desc_iter) {
+                    orphan->RDES0.Own = EMAC_LL_DMADESC_OWNER_DMA;
+                    DMA_CACHE_WB(orphan, EMAC_HAL_DMA_DESC_SIZE);
+                    orphan = (eth_dma_rx_descriptor_t *)(orphan->Buffer2NextDescAddr);
+                }
+                emac_hal_receive_poll_demand(&emac_esp_dma->hal);
+            }
             emac_esp_dma->rx_desc = desc_iter;
         }
         /* point to next descriptor */
